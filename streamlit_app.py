@@ -1,20 +1,26 @@
-# streamlit_app.py — deep diagnostic version
+# streamlit_app_advanced.py — Advanced torque & drag app
 from __future__ import annotations
-import math, io, itertools, time
-import numpy as np
-import pandas as pd
+import math, numpy as np, pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 DEG2RAD = math.pi/180.0
 IN2FT   = 1.0/12.0
 
-st.set_page_config(page_title="Torque & Drag — Deep Diagnostics", layout="wide")
+st.set_page_config(page_title="Torque & Drag — Advanced", layout="wide")
 
 def clamp(x, lo, hi): return max(lo, min(hi, x))
 def bf_from_mw(mw_ppg): return (65.5 - mw_ppg)/65.5
 
-# ───────────────────── Synthetic surveys ─────────────────────
+# Minimal tool-joint DB (example ratings)
+TOOL_JOINT_DB = {
+    "NC38": {"od": 4.75, "id": 2.25, "T_makeup_ftlbf": 12000, "F_tensile_lbf": 350000, "T_yield_ftlbf": 20000},
+    "NC40": {"od": 5.00, "id": 2.25, "T_makeup_ftlbf": 16000, "F_tensile_lbf": 420000, "T_yield_ftlbf": 25000},
+    "NC50": {"od": 6.63, "id": 3.00, "T_makeup_ftlbf": 30000, "F_tensile_lbf": 650000, "T_yield_ftlbf": 45000},
+}
+
+# ───────── Synthetic surveys (same API as before) ─────────
 def synth_build_hold(kop_md, build_rate, theta_hold_deg, target_md, az_deg):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
@@ -44,7 +50,7 @@ def synth_horizontal(kop_md, build_rate, lateral_length, target_md, az_deg, thet
         theta = np.where(md <= m_h, np.minimum(theta_max, np.maximum(0.0, md - kop_md) * br), theta_max)
     az = np.full_like(md, az_deg, dtype=float); return md, theta, az
 
-# ───────────────────── Minimum curvature & DLS ─────────────────────
+# Minimum Curvature geometry
 def mincurv_positions(md, inc_deg, az_deg):
     ds = np.diff(md)
     n = len(md)
@@ -53,220 +59,248 @@ def mincurv_positions(md, inc_deg, az_deg):
         I1 = inc_deg[i-1]*DEG2RAD; A1 = az_deg[i-1]*DEG2RAD
         I2 = inc_deg[i]*DEG2RAD;   A2 = az_deg[i]*DEG2RAD
         dmd = ds[i-1]
-        cos_dl = np.clip(np.cos(I1)*np.cos(I2) + np.sin(I1)*np.sin(I2)*np.cos(A2 - A1), -1.0, 1.0)
-        dpsi = np.arccos(cos_dl)
-        RF = np.where(dpsi < 1e-12, 1.0, (2.0/dpsi)*np.tan(dpsi/2.0))
-        dN = 0.5*dmd*(np.sin(I1)*np.cos(A1)+np.sin(I2)*np.cos(A2))*RF
-        dE = 0.5*dmd*(np.sin(I1)*np.sin(A1)+np.sin(I2)*np.sin(A2))*RF
-        dZ = 0.5*dmd*(np.cos(I1)+np.cos(I2))*RF
+        cos_dl = clamp(math.cos(I1)*math.cos(I2) + math.sin(I1)*math.sin(I2)*math.cos(A2 - A1), -1.0, 1.0)
+        dpsi = math.acos(cos_dl)
+        RF = 1.0 if dpsi < 1e-12 else (2.0/dpsi)*math.tan(dpsi/2.0)
+        dN = 0.5*dmd*(math.sin(I1)*math.cos(A1)+math.sin(I2)*math.cos(A2))*RF
+        dE = 0.5*dmd*(math.sin(I1)*math.sin(A1)+math.sin(I2)*math.sin(A2))*RF
+        dZ = 0.5*dmd*(math.cos(I1)+math.cos(I2))*RF
         N[i] = N[i-1]+dN; E[i] = E[i-1]+dE; TVD[i] = TVD[i-1]+dZ
         DLS[i] = (dpsi/DEG2RAD)/dmd*100.0 if dmd>0 else 0.0
     kappa = DLS/100.0*DEG2RAD   # 1/ft
     return N, E, TVD, DLS, kappa
 
-# ───────────────────── Johancsik soft-string stepper ─────────────────────
-def pick_section(depth, segments):
-    for seg in segments:
-        if seg["top"] <= depth <= seg["bottom"]:
-            return seg
-    return segments[-1]
+# Section-wise μ scheduler
+def mu_at_depth(depth, shoe_md, mu_sections, kind):
+    """kind in {'slide','rot'}; mu_sections is a list of dicts with top, bottom, mu_casing_kind, mu_oh_kind"""
+    for sec in mu_sections:
+        if sec["top"] <= depth <= sec["bottom"]:
+            if depth <= shoe_md:
+                return sec[f"mu_casing_{kind}"]
+            else:
+                return sec[f"mu_oh_{kind}"]
+    # fallback to last
+    sec = mu_sections[-1]
+    return sec[f"mu_casing_{kind}"] if depth <= shoe_md else sec[f"mu_oh_{kind}"]
 
-def johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case, mu_oh, shoe_md, scenario="pickup"):
+# Advanced stepper with section-wise μ and rotate-off factor
+def johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_sections, shoe_md, scenario="pickup", rot_fc=0.6, WOB_lbf=0.0, Mbit_ftlbf=0.0):
     ds = 1.0
-    n = len(md)
     inc = np.deg2rad(inc_deg)
-    BF = (65.5 - mw_ppg)/65.5
+    n = len(md)
+    BF = bf_from_mw(mw_ppg)
 
-    # Per-depth properties
+    # per-depth props
     od = np.zeros(n); w_b = np.zeros(n); mu_s = np.zeros(n); mu_r = np.zeros(n); N_side = np.zeros(n)
     for i in range(n):
         depth = md[i]
-        seg = pick_section(depth, segments)
-        od[i] = seg["od_in"]
-        w_b[i] = seg["weight_lbft"]*BF
-        if depth <= shoe_md:
-            mu_s[i] = mu_case["slide"]; mu_r[i] = mu_case["rot"]
-        else:
-            mu_s[i] = mu_oh["slide"];   mu_r[i] = mu_oh["rot"]
+        # string section
+        seg = None
+        for s in segments:
+            if s["top"] <= depth <= s["bottom"]:
+                seg = s; break
+        if seg is None: seg = segments[-1]
+        od[i] = float(seg["od_in"])
+        w_b[i] = float(seg["weight_lbft"]) * BF
+        mu_s[i] = mu_at_depth(depth, shoe_md, mu_sections, "slide")
+        mu_r[i] = mu_at_depth(depth, shoe_md, mu_sections, "rot")
 
-    # Integrate from TD up to surface
+    if scenario == "rotate_off":
+        mu_s = mu_s * rot_fc  # reduce sliding friction when rotating off-bottom
+    # integrate TD -> surface
     T = np.zeros(n); M = np.zeros(n)
-    sgn_ax = +1.0 if scenario=="pickup" else -1.0
+    if scenario == "onbottom":
+        T[-1] = -float(WOB_lbf)   # compressive at bit
+        M[-1] = float(Mbit_ftlbf) # motor torque at bit
+
+    sgn_ax = {"pickup": +1.0, "slackoff": -1.0, "rotate_off": +1.0, "onbottom": +1.0}.get(scenario, +1.0)
+
     for i in range(n-2, -1, -1):
-        th = inc[i+1]
-        N_side[i+1] = w_b[i+1]*np.sin(th) + np.abs(T[i+1])*kappa[i+1]
-        dT = (sgn_ax*w_b[i+1]*np.cos(th) + mu_s[i+1]*N_side[i+1]) * ds
-        T[i] = T[i+1] + dT
+        th = inc[i+1]; kap = kappa[i+1]
+        N_raw = w_b[i+1]*math.sin(th) + abs(T[i+1])*kap
+        N_side[i+1] = max(0.0, N_raw)
+        dT = (sgn_ax*w_b[i+1]*math.cos(th) + mu_s[i+1]*N_side[i+1]) * ds
         r_eff = 0.5*od[i+1]*IN2FT
-        M[i] = M[i+1] + (mu_r[i+1]*N_side[i+1]*r_eff)*ds
+        dM = (mu_r[i+1]*N_side[i+1]*r_eff)*ds
+        T[i] = T[i+1] + dT
+        M[i] = M[i+1] + dM
+
     neutral_idx = int(np.argmin(np.abs(T)))
     return T, M, neutral_idx, od, w_b, mu_s, mu_r, N_side
 
-# ─────────────────────────────── UI ─────────────────────────────────
-st.title("Torque & Drag — Deep Diagnostics")
-st.caption("Johancsik soft-string with casing/OH masks, multi-string, tortuosity, multi-μ comparisons, and trip torque. Δs=1 ft.")
+# API-style combined limit utilization (simple form): U = max(T/T_lim, M/M_lim)
+def combined_limit_util(T_surface, M_surface, tj_spec):
+    T_lim = tj_spec["F_tensile_lbf"]
+    M_lim = tj_spec["T_yield_ftlbf"]
+    return max( abs(T_surface)/T_lim if T_lim>0 else 0.0,
+                abs(M_surface)/M_lim if M_lim>0 else 0.0 )
 
-with st.sidebar:
-    st.header("Trajectory")
-    profile = st.selectbox("Profile", ["Build & Hold", "Build–Hold–Drop", "Horizontal (build + lateral)"])
-    kop_md  = st.number_input("KOP MD (ft)", 0.0, 50000.0, 2000.0, 50.0)
-    build   = st.number_input("Build rate (deg/100 ft)", 0.0, 30.0, 3.0, 0.1)
-    az_deg  = st.number_input("Azimuth (deg)", 0.0, 360.0, 0.0, 1.0)
-    if profile == "Build & Hold":
-        theta_hold = st.number_input("Final inclination (deg)", 0.0, 90.0, 30.0, 0.5)
-        target_md  = st.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
-        md, inc_deg, az = synth_build_hold(kop_md, build, theta_hold, target_md, az_deg)
-    elif profile == "Build–Hold–Drop":
-        theta_hold = st.number_input("Hold inclination (deg)", 0.0, 90.0, 30.0, 0.5)
-        drop_rate  = st.number_input("Drop rate (deg/100 ft)", 0.0, 30.0, 2.0, 0.1)
-        target_md  = st.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
-        md, inc_deg, az = synth_build_hold_drop(kop_md, build, theta_hold, drop_rate, target_md, az_deg)
-    else:
-        lateral    = st.number_input("Lateral length (ft)", 0.0, 30000.0, 2000.0, 100.0)
-        target_md  = st.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
-        md, inc_deg, az = synth_horizontal(kop_md, build, lateral, target_md, az_deg)
+# ───────────────────────────── UI ─────────────────────────────────
+st.title("Torque & Drag — Advanced (Calibration, Section-wise μ, Rig Limits)")
+st.caption("Johancsik soft-string (Δs=1 ft) with section-wise μ, μ calibration, rotate-off factor, motor torque, and rig-limit checks.")
 
-    # Casing mask
-    st.header("Friction Masks")
-    shoe_md = st.number_input("Casing shoe MD (ft)", 0.0, float(md[-1]), min(float(md[-1])*0.5, 8000.0), 50.0)
-    st.write("Scenario 1 μ (used for base plots below):")
-    mu_case_slide_1 = st.number_input("μ casing slide (S1)", 0.02, 0.60, 0.15, 0.01)
-    mu_case_rot_1   = st.number_input("μ casing rot (S1)",   0.01, 0.60, 0.06, 0.01)
-    mu_oh_slide_1   = st.number_input("μ open-hole slide (S1)", 0.05, 0.90, 0.30, 0.01)
-    mu_oh_rot_1     = st.number_input("μ open-hole rot (S1)",   0.02, 0.90, 0.12, 0.01)
+# Trajectory
+c1, c2, c3, c4 = st.columns(4)
+profile = c1.selectbox("Profile", ["Build & Hold", "Build–Hold–Drop", "Horizontal (build + lateral)"])
+kop_md  = c2.number_input("KOP MD (ft)", 0.0, 50000.0, 2000.0, 50.0)
+build   = c3.number_input("Build rate (deg/100 ft)", 0.0, 30.0, 3.0, 0.1)
+az_deg  = c4.number_input("Azimuth (deg)", 0.0, 360.0, 0.0, 1.0)
+if profile == "Build & Hold":
+    theta_hold = st.number_input("Final inclination (deg)", 0.0, 90.0, 30.0, 0.5)
+    target_md  = st.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
+    md, inc_deg, az = synth_build_hold(kop_md, build, theta_hold, target_md, az_deg)
+elif profile == "Build–Hold–Drop":
+    theta_hold = st.number_input("Hold inclination (deg)", 0.0, 90.0, 30.0, 0.5)
+    drop_rate  = st.number_input("Drop rate (deg/100 ft)", 0.0, 30.0, 2.0, 0.1)
+    target_md  = st.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
+    md, inc_deg, az = synth_build_hold_drop(kop_md, build, theta_hold, drop_rate, target_md, az_deg)
+else:
+    lateral    = st.number_input("Lateral length (ft)", 0.0, 30000.0, 2000.0, 100.0)
+    target_md  = st.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
+    md, inc_deg, az = synth_horizontal(kop_md, build, lateral, target_md, az_deg)
 
-    st.write("Optional μ Scenarios 2 & 3 for comparison:")
-    enable_s2 = st.checkbox("Enable Scenario 2")
-    if enable_s2:
-        mu_case_slide_2 = st.number_input("μ casing slide (S2)", 0.02, 0.60, 0.20, 0.01)
-        mu_case_rot_2   = st.number_input("μ casing rot (S2)",   0.01, 0.60, 0.08, 0.01)
-        mu_oh_slide_2   = st.number_input("μ open-hole slide (S2)", 0.05, 0.90, 0.35, 0.01)
-        mu_oh_rot_2     = st.number_input("μ open-hole rot (S2)",   0.02, 0.90, 0.15, 0.01)
-    enable_s3 = st.checkbox("Enable Scenario 3")
-    if enable_s3:
-        mu_case_slide_3 = st.number_input("μ casing slide (S3)", 0.02, 0.60, 0.12, 0.01)
-        mu_case_rot_3   = st.number_input("μ casing rot (S3)",   0.01, 0.60, 0.05, 0.01)
-        mu_oh_slide_3   = st.number_input("μ open-hole slide (S3)", 0.05, 0.90, 0.25, 0.01)
-        mu_oh_rot_3     = st.number_input("μ open-hole rot (S3)",   0.02, 0.90, 0.10, 0.01)
-
-    st.header("Mud & Multi‑String")
-    mw_ppg = st.number_input("Mud weight (ppg)", 7.0, 20.0, 10.0, 0.1)
-
-    st.caption("Define Top/Bottom MD and properties for DC, HWDP, DP.")
-    def seg_editor(label, default_top, default_bot, od, w):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: top = st.number_input(f"{label} Top MD", 0.0, float(md[-1]), default_top, 100.0, key=label+"t")
-        with c2: bot = st.number_input(f"{label} Bottom MD", 0.0, float(md[-1]), default_bot, 100.0, key=label+"b")
-        with c3: od_in = st.number_input(f"{label} OD (in)", 2.0, 10.0, od, 0.125, key=label+"o")
-        with c4: w_air = st.number_input(f"{label} weight (lb/ft)", 5.0, 120.0, w, 0.5, key=label+"w")
-        return {"top": min(top, bot), "bottom": max(top, bot), "od_in": od_in, "weight_lbft": w_air}
-    seg_dc   = seg_editor("DC",   0.0, min(800.0, md[-1]), 6.5, 50.0)
-    seg_hwdp = seg_editor("HWDP", seg_dc["bottom"], min(2000.0, md[-1]), 5.0, 35.0)
-    seg_dp   = seg_editor("DP",   seg_hwdp["bottom"], float(md[-1]), 5.0, 19.5)
-    segments = [seg_dc, seg_hwdp, seg_dp]
-
-# Geometry & curvature
 N, E, TVD, DLS, kappa = mincurv_positions(md, inc_deg, az)
+VS = N*np.cos(az[0]*DEG2RAD) + E*np.sin(az[0]*DEG2RAD)
+st.plotly_chart(go.Figure(data=[go.Scatter3d(x=E, y=N, z=TVD, mode="lines")]).update_layout(
+    scene=dict(zaxis=dict(autorange="reversed"), xaxis_title="East", yaxis_title="North", zaxis_title="TVD"),
+    height=360
+), use_container_width=True)
 
-# Base scenario (S1)
-mu_case_1 = {"slide": mu_case_slide_1, "rot": mu_case_rot_1}
-mu_oh_1   = {"slide": mu_oh_slide_1,   "rot": mu_oh_rot_1}
-T_pu_1, M_ro_1, neutral_pu_1, od_1, w_b_1, mu_s_1, mu_r_1, N_side_1 = johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case_1, mu_oh_1, shoe_md, "pickup")
-T_so_1, _,          neutral_so_1, _,    _,      _,      _,      _    = johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case_1, mu_oh_1, shoe_md, "slackoff")
+# String
+st.subheader("Drillstring sections (Top/Bottom MD, OD, weight/ft)")
+n_default = max(1, int(len(md)/4000))
+df_string = pd.DataFrame([
+    {"top": 0.0, "bottom": float(md[-1]), "od_in": 5.0, "weight_lbft": 19.5},
+])
+df_string = st.data_editor(df_string, num_rows="dynamic")
 
-# Optional scenarios
-scenarios = [("S1", T_pu_1, T_so_1, M_ro_1, mu_case_1, mu_oh_1)]
-if 'enable_s2' in globals() and enable_s2:
-    mu_case_2 = {"slide": mu_case_slide_2, "rot": mu_case_rot_2}
-    mu_oh_2   = {"slide": mu_oh_slide_2,   "rot": mu_oh_rot_2}
-    T_pu_2, M_ro_2, _, _, _, _, _, _ = johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case_2, mu_oh_2, shoe_md, "pickup")
-    T_so_2, _,   _, _, _, _, _, _     = johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case_2, mu_oh_2, shoe_md, "slackoff")
-    scenarios.append(("S2", T_pu_2, T_so_2, M_ro_2, mu_case_2, mu_oh_2))
-if 'enable_s3' in globals() and enable_s3:
-    mu_case_3 = {"slide": mu_case_slide_3, "rot": mu_case_rot_3}
-    mu_oh_3   = {"slide": mu_oh_slide_3,   "rot": mu_oh_rot_3}
-    T_pu_3, M_ro_3, _, _, _, _, _, _ = johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case_3, mu_oh_3, shoe_md, "pickup")
-    T_so_3, _,   _, _, _, _, _, _     = johancsik_step(md, inc_deg, kappa, mw_ppg, segments, mu_case_3, mu_oh_3, shoe_md, "slackoff")
-    scenarios.append(("S3", T_pu_3, T_so_3, M_ro_3, mu_case_3, mu_oh_3))
+# Friction masks — section-wise μ
+st.subheader("Section-wise μ (casing vs open-hole)")
+shoe_md = st.slider("Casing shoe MD (ft)", 0.0, float(md[-1]), min(8000.0, float(md[-1]*0.6)), 50.0)
+df_mu = pd.DataFrame([
+    {"top":0.0, "bottom": float(md[-1]), "mu_casing_slide":0.20, "mu_casing_rot":0.08, "mu_oh_slide":0.35, "mu_oh_rot":0.15}
+])
+df_mu = st.data_editor(df_mu, num_rows="dynamic")
 
-# ────────────────────────── Plots ───────────────────────────────────
+st.subheader("Mud & rotation / motor")
+mw_ppg   = st.number_input("Mud weight (ppg)", 7.0, 20.0, 10.0, 0.1)
+rot_fc   = st.slider("Rotate-off friction reduction factor", 0.3, 1.0, 0.6, 0.05)
+motor_on = st.checkbox("Motor on-bottom (bit torque = K*ΔP)", value=False)
+K_tbit   = st.number_input("K (ft-lbf/psi)", 0.0, 10000.0, 2.5, 0.1) if motor_on else 0.0
+deltaP   = st.number_input("ΔP (psi)", 0.0, 5000.0, 0.0, 1.0) if motor_on else 0.0
+WOB      = st.number_input("WOB (lbf)", 0.0, 150000.0, 6000.0, 100.0)
+Mbit     = K_tbit * deltaP if motor_on else 0.0
+scenario = st.selectbox("Scenario", ["Slack-off", "Pickup", "Rotate off-bottom", "Rotate on-bottom"])
+scenario_key = {"Slack-off":"slackoff","Pickup":"pickup","Rotate off-bottom":"rotate_off","Rotate on-bottom":"onbottom"}[scenario]
+
+# Rig / tool-joint limits
+st.subheader("Rig & Tool-joint limits")
+tj_name   = st.selectbox("Tool-joint", list(TOOL_JOINT_DB.keys()), index=1)
+TJ = TOOL_JOINT_DB[tj_name]
+rig_torque = st.number_input("Rig torque limit (ft-lbf)", 1000.0, 100000.0, 30000.0, 100.0)
+rig_hl     = st.number_input("Hookload limit (lbf)",     10000.0, 1000000.0, 400000.0, 1000.0)
+
+# Run the advanced stepper
+segments = df_string.to_dict(orient="records")
+mu_sections = df_mu.to_dict(orient="records")
+T, M, neutral_idx, od, w_b, mu_s, mu_r, N_side = johancsik_step(
+    md, inc_deg, kappa, mw_ppg, segments, mu_sections, shoe_md,
+    scenario=scenario_key, rot_fc=rot_fc, WOB_lbf=WOB, Mbit_ftlbf=Mbit
+)
+
+# Plots
 c1, c2 = st.columns(2)
 with c1:
-    st.subheader("3D Path (split at shoe)")
-    idx_shoe = int(np.clip(np.searchsorted(md, shoe_md), 0, len(md)-1))
-    fig3d = go.Figure()
-    fig3d.add_trace(go.Scatter3d(x=E[:idx_shoe+1], y=N[:idx_shoe+1], z=TVD[:idx_shoe+1], mode="lines", name="Cased"))
-    fig3d.add_trace(go.Scatter3d(x=E[idx_shoe:], y=N[idx_shoe:], z=TVD[idx_shoe:], mode="lines", name="Open hole"))
-    fig3d.update_layout(height=460, scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)", zaxis=dict(autorange="reversed")),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0))
-    st.plotly_chart(fig3d, use_container_width=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=md, y=-T, name="Hookload (−T)"))
+    fig.add_hline(y=rig_hl, line_dash="dot", annotation_text="Rig HL limit")
+    fig.update_layout(xaxis_title="MD (ft)", yaxis_title="Hookload (lbf)")
+    st.plotly_chart(fig, use_container_width=True)
 with c2:
-    st.subheader("2D — TVD vs VS (split)")
-    VS = N*np.cos(az[0]*DEG2RAD) + E*np.sin(az[0]*DEG2RAD)
-    fig2d = go.Figure()
-    fig2d.add_trace(go.Scatter(x=VS[:idx_shoe+1], y=TVD[:idx_shoe+1], mode="lines", name="Cased"))
-    fig2d.add_trace(go.Scatter(x=VS[idx_shoe:], y=TVD[idx_shoe:], mode="lines", name="Open hole"))
-    fig2d.update_layout(height=460, xaxis_title="Vertical Section (ft)", yaxis_title="TVD (ft)", yaxis=dict(autorange="reversed"))
-    st.plotly_chart(fig2d, use_container_width=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=md, y=np.abs(M), name="Torque |M|"))
+    fig.add_hline(y=rig_torque, line_dash="dot", annotation_text="Rig torque limit")
+    fig.update_layout(xaxis_title="MD (ft)", yaxis_title="Torque (ft-lbf)")
+    st.plotly_chart(fig, use_container_width=True)
 
-c3, c4 = st.columns(2)
-with c3:
-    st.subheader("Pickup / Slack-off Hookload")
-    figHL = go.Figure()
-    for name, T_pu, T_so, M_ro, mu_case, mu_oh in scenarios:
-        figHL.add_trace(go.Scatter(x=md, y=-T_so, name=f"Slack-off {name}"))
-        figHL.add_trace(go.Scatter(x=md, y=-T_pu, name=f"Pickup {name}", line=dict(dash="dash")))
-    figHL.update_layout(xaxis_title="MD (ft)", yaxis_title="Hookload (lbf)")
-    st.plotly_chart(figHL, use_container_width=True)
-with c4:
-    st.subheader("Rotating Torque vs MD")
-    figT = go.Figure()
-    for name, T_pu, T_so, M_ro, mu_case, mu_oh in scenarios:
-        figT.add_trace(go.Scatter(x=md, y=np.abs(M_ro), name=f"Torque {name}"))
-    figT.update_layout(xaxis_title="MD (ft)", yaxis_title="Torque (ft-lbf, proxy)")
-    st.plotly_chart(figT, use_container_width=True)
+# Combined limit utilization at surface
+U = combined_limit_util(-T[0], M[0], TJ)  # surface values
+st.markdown(f"**Combined limit util. (API-style)** at surface with {tj_name}: **{U:.2f}** (≥1.0 = exceed)")
 
-c5, c6 = st.columns(2)
-with c5:
-    st.subheader("Tension vs Inclination (diagnostic) — S1")
-    figTI = go.Figure()
-    figTI.add_trace(go.Scatter(x=inc_deg, y=T_pu_1, name="Pickup T"))
-    figTI.add_trace(go.Scatter(x=inc_deg, y=T_so_1, name="Slack-off T", line=dict(dash="dash")))
-    figTI.update_layout(xaxis_title="Inclination (deg)", yaxis_title="Axial Tension (lbf)")
-    st.plotly_chart(figTI, use_container_width=True)
-with c6:
-    st.subheader("Tortuosity: DLS and Curvature κ")
-    figD = go.Figure()
-    figD.add_trace(go.Scatter(x=md, y=DLS, name="DLS (deg/100 ft)"))
-    figD.add_trace(go.Scatter(x=md, y=kappa, name="κ (1/ft)", yaxis="y2"))
-    figD.update_layout(
-        xaxis=dict(title="MD (ft)"),
-        yaxis=dict(title="DLS (deg/100 ft)"),
-        yaxis2=dict(title="κ (1/ft)", overlaying="y", side="right"))
-    st.plotly_chart(figD, use_container_width=True)
-
-st.subheader("Trip‑log Torque (simple simulator) — S1")
-speed = st.slider("Trip speed (ft/min)", 5, 200, 60, 5)
-dt = 1.0  # minute
-t = np.arange(0, max(1, math.ceil(md[-1]/speed))+dt, dt)
-bit_md = np.clip(t*speed, 0, md[-1])
-idx = np.searchsorted(md, bit_md)
-trip_torque = np.abs(M_ro_1[idx])
-figTrip = go.Figure()
-figTrip.add_trace(go.Scatter(x=t, y=trip_torque, name="Torque during trip"))
-figTrip.update_layout(xaxis_title="Time (min)", yaxis_title="Torque (ft-lbf, proxy)")
-st.plotly_chart(figTrip, use_container_width=True)
-
-# Table & CSV
+# Export table
 df = pd.DataFrame({
-    "MD_ft": md, "Inc_deg": inc_deg, "Az_deg": az, "TVD_ft": TVD, "North_ft": N, "East_ft": E,
-    "DLS_deg_per_100ft": DLS, "kappa_1_per_ft": kappa, "OD_in": od_1, "w_b_lbft": w_b_1,
-    "mu_slide": mu_s_1, "mu_rot": mu_r_1, "N_side_lbf_per_ft": N_side_1,
-    "T_pickup_lbf": T_pu_1, "T_slackoff_lbf": T_so_1, "Torque_rot_ftlbf": M_ro_1
+    "MD_ft": md, "Inc_deg": inc_deg, "Az_deg": az,
+    "TVD_ft": TVD, "North_ft": N, "East_ft": E, "VS_ft": VS,
+    "DLS_deg_per_100ft": DLS, "kappa_1_per_ft": kappa,
+    "OD_in": od, "w_b_lbft": w_b, "mu_slide": mu_s, "mu_rot": mu_r,
+    "N_side_lbf_per_ft": N_side, "T_lbf": T, "M_ftlbf": M
 })
-st.markdown(f"**Neutral point (pickup)** ≈ {md[int(np.argmin(np.abs(T_pu_1)))]:.0f} ft · **Neutral point (slack-off)** ≈ {md[int(np.argmin(np.abs(T_so_1)))]:.0f} ft")
 st.dataframe(df.head(20), use_container_width=True)
-csv_bytes = df.to_csv(index=False).encode("utf-8")
-st.download_button("Download CSV", data=csv_bytes, file_name="tdrag_deep_output.csv", mime="text/csv")
+st.download_button("Download results CSV", df.to_csv(index=False).encode("utf-8"), "tdrag_advanced.csv", "text/csv")
 
-st.caption("Physics: Johancsik soft-string with N = w·sinθ + |T|·κ, ΔM = μ_rot·N·r_eff. For production, extend with 3D contact and torsional balance.")
+# μ calibration grid (optional)
+st.subheader("μ calibration grid (fit to measured)")
+with st.expander("Calibrate μ to measured data"):
+    depth_for_fit = st.number_input("Depth to fit (ft)", 0.0, float(md[-1]), float(md[-1]), 50.0)
+    measured_pickup_hl   = st.number_input("Measured HL (Pickup) at depth (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    measured_slackoff_hl = st.number_input("Measured HL (Slack-off) at depth (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    measured_rotate_hl   = st.number_input("Measured HL (Rotate off) at depth (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    measured_surface_torque = st.number_input("Measured Surface Torque (ft-lbf)", 0.0, 200_000.0, 0.0, 100.0)
+
+    st.markdown("Define coarse ranges for μ (start, stop, step). Use small grids to keep it fast.")
+    c1, c2 = st.columns(2)
+    with c1:
+        mu_c_s_rng = st.text_input("μ casing slide range (e.g. 0.10,0.30,0.05)", "0.10,0.30,0.05")
+        mu_o_s_rng = st.text_input("μ OH slide range (e.g. 0.20,0.45,0.05)", "0.20,0.45,0.05")
+    with c2:
+        mu_c_r_rng = st.text_input("μ casing rot range (e.g. 0.04,0.15,0.03)", "0.04,0.15,0.03")
+        mu_o_r_rng = st.text_input("μ OH rot range (e.g. 0.08,0.25,0.03)", "0.08,0.25,0.03")
+
+    def parse_rng(txt):
+        try:
+            a,b,s = [float(x.strip()) for x in txt.split(",")]
+            return np.arange(a, b+1e-9, s)
+        except:
+            return np.array([])
+
+    if st.button("Run calibration grid"):
+        idx = int(np.searchsorted(md, depth_for_fit, side="right"))
+        md_fit = md[:idx+1]; inc_fit = inc_deg[:idx+1]; kappa_fit = kappa[:idx+1]
+
+        mu_c_s_vals = parse_rng(mu_c_s_rng); mu_o_s_vals = parse_rng(mu_o_s_rng)
+        mu_c_r_vals = parse_rng(mu_c_r_rng); mu_o_r_vals = parse_rng(mu_o_r_rng)
+
+        best = None; best_err = 1e99
+        for mu_c_s in mu_c_s_vals:
+            for mu_o_s in mu_o_s_vals:
+                for mu_c_r in mu_c_r_vals:
+                    for mu_o_r in mu_o_r_vals:
+                        mu_sections_try = [{"top":0.0,"bottom":float(md[-1]),
+                                            "mu_casing_slide":mu_c_s,"mu_casing_rot":mu_c_r,
+                                            "mu_oh_slide":mu_o_s,"mu_oh_rot":mu_o_r}]
+                        # slack-off
+                        T_sl, M_sl, _, *_ = johancsik_step(md_fit, inc_fit, kappa_fit, mw_ppg, segments, mu_sections_try, shoe_md, "slackoff", rot_fc)
+                        HL_sl = max(0.0, -T_sl[0])
+                        err2 = 0.0
+                        if measured_slackoff_hl>0: err2 += (HL_sl - measured_slackoff_hl)**2
+                        # pickup
+                        T_pu, M_pu, _, *_ = johancsik_step(md_fit, inc_fit, kappa_fit, mw_ppg, segments, mu_sections_try, shoe_md, "pickup", rot_fc)
+                        HL_pu = max(0.0, -T_pu[0])
+                        if measured_pickup_hl>0: err2 += (HL_pu - measured_pickup_hl)**2
+                        # rotate-off
+                        if measured_rotate_hl>0:
+                            T_ro, M_ro, _, *_ = johancsik_step(md_fit, inc_fit, kappa_fit, mw_ppg, segments, mu_sections_try, shoe_md, "rotate_off", rot_fc)
+                            HL_ro = max(0.0, -T_ro[0]); err2 += (HL_ro - measured_rotate_hl)**2
+                        # torque
+                        if measured_surface_torque>0:
+                            T_ro, M_ro, _, *_ = johancsik_step(md_fit, inc_fit, kappa_fit, mw_ppg, segments, mu_sections_try, shoe_md, "rotate_off", rot_fc)
+                            err2 += (abs(M_ro[0]) - measured_surface_torque)**2
+                        if err2 < best_err:
+                            best_err = err2
+                            best = dict(mu_c_s=float(mu_c_s), mu_o_s=float(mu_o_s), mu_c_r=float(mu_c_r), mu_o_r=float(mu_o_r), SSE=float(err2))
+        if best:
+            st.success(f"Best μ set: {best}")
+        else:
+            st.warning("No valid grid or targets.")
+
+st.caption("Model: Johancsik soft-string with curvature (κ) and section-wise μ; rotate-off reduces friction; motor torque adds M at bit; combined limits per a simplified API-style check.")
